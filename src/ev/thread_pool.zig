@@ -46,6 +46,12 @@ pub const ThreadPool = struct {
     /// is decremented off the queue lock, on the running worker at completion.
     reserved_running: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
 
+    /// Spawn failures (regular or reserved). Work stays queued and runs when a
+    /// worker frees; this counter is the explicit "pool pressure / OS refuse"
+    /// signal for product metrics (blockInPlace never returns OutOfThreads —
+    /// that would break ML-KEM callers that are not error unions).
+    spawn_fail: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     pub const Options = struct {
         min_threads: usize = 0,
         max_threads: ?usize = null,
@@ -231,8 +237,10 @@ pub const ThreadPool = struct {
             // Forced: a reserved job may need capacity beyond max_threads. On
             // failure the job stays queued (reserved_pending is dropped when a
             // worker eventually picks it up) and runs once a worker frees up —
-            // the hard guarantee degrades, but nothing is lost.
+            // the hard guarantee degrades, but nothing is lost. `spawn_fail`
+            // surfaces the degradation to product pressureFiber.
             self.spawnThread(true) catch |err| {
+                _ = self.spawn_fail.fetchAdd(1, .monotonic);
                 log.err("Failed to spawn reserved thread: {}", .{err});
             };
             return;
@@ -247,9 +255,35 @@ pub const ThreadPool = struct {
         const should_spawn = running < self.min_threads or (idle == 0 and queued >= running * self.scale_threshold and running < ceiling);
         if (should_spawn) {
             self.spawnThread(false) catch |err| {
+                _ = self.spawn_fail.fetchAdd(1, .monotonic);
                 log.err("Failed to spawn thread: {}", .{err});
             };
         }
+    }
+
+    /// Snapshot for product metrics (DNS vs Reserved pressure / 6400-hold).
+    pub const Stats = struct {
+        running: usize,
+        idle: usize,
+        queued: usize,
+        reserved_pending: usize,
+        reserved_running: usize,
+        spawn_fail: u64,
+        max_threads: usize,
+    };
+
+    pub fn stats(self: *ThreadPool) Stats {
+        self.queue_mutex.lock();
+        defer self.queue_mutex.unlock();
+        return .{
+            .running = self.running_threads.load(.monotonic),
+            .idle = self.idle_threads.load(.monotonic),
+            .queued = self.queue_size,
+            .reserved_pending = self.reserved_pending,
+            .reserved_running = self.reserved_running.load(.monotonic),
+            .spawn_fail = self.spawn_fail.load(.monotonic),
+            .max_threads = self.max_threads,
+        };
     }
 
     pub fn cancel(self: *ThreadPool, work: *Work) void {
