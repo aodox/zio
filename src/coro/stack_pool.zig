@@ -68,7 +68,8 @@ pub const Config = struct {
     /// individually mapped stacks, oldest first. A burst therefore
     /// re-inflates the target instantly, while its capacity drains with a
     /// half-life of one interval instead of falling off a cliff. Between
-    /// evaluations, releasing and reusing stacks never makes a syscall.
+    /// evaluations, `release` still soft-frees dirtied pages via
+    /// `stackRecycle` (madvise); hard unmap only happens in shrink.
     /// `.zero` disables shrinking entirely; the pool then holds its
     /// high-water mark until deinit.
     shrink_interval: Duration = .fromSeconds(60),
@@ -113,6 +114,12 @@ pub const StackPool = struct {
     /// per interval on the way down (see Config.shrink_interval).
     retain_target: usize,
     last_shrink: Timestamp,
+    /// Cumulative `stackRecycle` calls from `release` (monotonic).
+    recycle_count: u64,
+    /// Cumulative bytes successfully advised by `stackRecycle` (monotonic).
+    recycle_bytes: u64,
+    /// Cumulative slabs + individual stacks unmapped by `shrink` (monotonic).
+    shrink_unmap: u64,
 
     pub fn init(config: Config) StackPool {
         // Same slot layout as stackAllocPosix: usable size rounded to pages,
@@ -132,23 +139,48 @@ pub const StackPool = struct {
             .epoch_peak = 0,
             .retain_target = 0,
             .last_shrink = .zero,
+            .recycle_count = 0,
+            .recycle_bytes = 0,
+            .shrink_unmap = 0,
         };
     }
 
     /// Snapshot for product metrics (RSS / 6400-hold observability).
+    ///
+    /// `free` + `slabs` + `retain_target` explain VA/freelist water levels;
+    /// `recycle_*` vs process RSS shows whether madvise advice actually moved
+    /// the working set (Linux DONTNEED / Darwin FREE_REUSABLE should; FREE
+    /// would not). `shrink_unmap` is hard reclaim of idle capacity.
     pub const Stats = struct {
         in_use: usize,
+        free: usize,
+        slabs: usize,
         retain_target: usize,
         epoch_peak: usize,
+        recycle_count: u64,
+        recycle_kib: u64,
+        shrink_unmap: u64,
     };
 
     pub fn stats(self: *StackPool) Stats {
         self.mutex.lock();
         defer self.mutex.unlock();
+        var free_capacity: usize = self.pool_size;
+        var slab_count: usize = 0;
+        var slab = self.slabs;
+        while (slab) |s| : (slab = s.next) {
+            free_capacity += s.carved - s.in_use;
+            slab_count += 1;
+        }
         return .{
             .in_use = self.in_use,
+            .free = free_capacity,
+            .slabs = slab_count,
             .retain_target = self.retain_target,
             .epoch_peak = self.epoch_peak,
+            .recycle_count = self.recycle_count,
+            .recycle_kib = self.recycle_bytes / 1024,
+            .shrink_unmap = self.shrink_unmap,
         };
     }
 
@@ -244,7 +276,7 @@ pub const StackPool = struct {
     pub fn release(self: *StackPool, stack_info: StackInfo) void {
         // Soft-free before writing FreeNode so REALITY-sized dirty pages drop
         // from the working set; the FreeNode store faults one page back.
-        stack.stackRecycle(stack_info);
+        const recycled = stack.stackRecycle(stack_info);
 
         // The FreeNode is stored at the base of the stack (aligned backward)
         const node_addr = std.mem.alignBackward(usize, stack_info.base - @sizeOf(FreeNode), @alignOf(FreeNode));
@@ -260,6 +292,8 @@ pub const StackPool = struct {
                 // above base), but cheap paranoia in safe builds: the slab
                 // must contain this slot.
                 self.mutex.lock();
+                self.recycle_count +%= 1;
+                self.recycle_bytes +%= recycled;
                 if (compat.is_debug) {
                     std.debug.assert(self.slabOfLocked(stack_info.allocation_ptr) == slab);
                 }
@@ -281,6 +315,8 @@ pub const StackPool = struct {
         }
 
         self.mutex.lock();
+        self.recycle_count +%= 1;
+        self.recycle_bytes +%= recycled;
         self.in_use -= 1;
 
         // Verify the FreeNode fits within the committed region (between limit and base)
@@ -393,18 +429,26 @@ pub const StackPool = struct {
             }
         }
 
-        // Return memory to the OS outside the lock.
+        // Return memory to the OS outside the lock; count unmaps for metrics.
+        var unmapped: u64 = 0;
         if (slab_supported) {
             while (slabs_to_free) |s| {
                 const next = s.next;
                 stack.slabFree(s.memory);
+                unmapped +%= 1;
                 slabs_to_free = next;
             }
         }
         while (stacks_to_free) |node| {
             const next = node.next;
             stack.stackFree(node.stack_info);
+            unmapped +%= 1;
             stacks_to_free = next;
+        }
+        if (unmapped != 0) {
+            self.mutex.lock();
+            self.shrink_unmap +%= unmapped;
+            self.mutex.unlock();
         }
     }
 

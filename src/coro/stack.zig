@@ -301,26 +301,30 @@ fn stackFreePosix(info: StackInfo) void {
 /// dirtied ~230 KiB) does not keep physical pages under every later freelist
 /// owner — the Go/Xray iOS OOM class of "peak sticks forever".
 ///
-/// - Darwin: `MADV_FREE_REUSABLE` (drops from Jetsam phys_footprint immediately).
-/// - Linux/BSD: `MADV_FREE` (lazy reclaim under pressure).
-/// - Windows: no-op (Rtl stacks; shrink unmaps instead).
+/// Advice is chosen so process RSS / Jetsam phys_footprint actually moves
+/// (知其所以然 for proxy idle-RSS probes):
+/// - Darwin: `MADV_FREE_REUSABLE` (drops phys_footprint immediately).
+/// - Linux/BSD: `MADV_DONTNEED` — not `MADV_FREE`. FREE only marks pages
+///   reclaimable under pressure; RSS stays high until the kernel is starved,
+///   which makes 6400-hold "idle RSS" look stuck even after recycle. DONTNEED
+///   discards now; the FreeNode store / next frames fault pages back.
+/// - Windows: no-op (Rtl stacks; shrink unmaps instead). Returns 0.
 ///
-/// Next write fault recommits/zeros pages as needed (FreeNode / new frames).
-pub fn stackRecycle(info: StackInfo) void {
-    if (builtin.os.tag == .windows) return;
+/// Returns the byte length advised (0 on Windows / empty / madvise failure).
+pub fn stackRecycle(info: StackInfo) usize {
+    if (builtin.os.tag == .windows) return 0;
 
     const committed_start = info.limit;
     const committed_size = info.base - info.limit;
-    if (committed_size == 0) return;
+    if (committed_size == 0) return 0;
 
     const addr: [*]align(page_size) u8 = @ptrFromInt(committed_start);
     const advice: u32 = if (comptime builtin.os.tag.isDarwin())
         posix.MADV.FREE_REUSABLE
-    else if (comptime @hasDecl(posix.MADV, "FREE"))
-        posix.MADV.FREE
     else
         posix.MADV.DONTNEED;
-    posix.madvise(addr[0..committed_size], advice) catch {};
+    posix.madvise(addr[0..committed_size], advice) catch return 0;
+    return committed_size;
 }
 
 pub const StackExtendMode = enum {
@@ -818,7 +822,12 @@ test "Stack: recycle" {
     try std.testing.expect(mem[committed_len - 1] == 0xAA);
 
     // Recycle the stack (mark pages for kernel reclamation)
-    stackRecycle(stack);
+    const advised = stackRecycle(stack);
+    if (builtin.os.tag != .windows) {
+        try std.testing.expectEqual(committed_len, advised);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), advised);
+    }
 
     // Memory should still be accessible (though may be zero-filled by kernel)
     // We just verify no crash occurs
