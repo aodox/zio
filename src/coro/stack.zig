@@ -295,28 +295,32 @@ fn stackFreePosix(info: StackInfo) void {
     posix.munmap(info.allocation_ptr[0..info.allocation_len]) catch {};
 }
 
-/// Recycle stack memory for reuse by marking committed pages as available for kernel reclamation.
-/// This is useful for stack pooling - the virtual address space remains reserved but the physical
-/// memory can be reclaimed by the kernel if needed. Pages will be zero-filled on next access.
+/// Soft-free committed stack pages while keeping the VA reservation.
 ///
-/// Uses MADV_FREE which allows lazy reclamation - pages are marked as candidates for reclamation
-/// but are only actually freed when the system is under memory pressure.
+/// Used by `StackPool.release` so a deep call chain (e.g. REALITY handshake
+/// dirtied ~230 KiB) does not keep physical pages under every later freelist
+/// owner — the Go/Xray iOS OOM class of "peak sticks forever".
 ///
-/// Supported on: Linux 4.5+, macOS, FreeBSD, NetBSD
-/// On Windows: No-op (stack recycling not currently implemented)
+/// - Darwin: `MADV_FREE_REUSABLE` (drops from Jetsam phys_footprint immediately).
+/// - Linux/BSD: `MADV_FREE` (lazy reclaim under pressure).
+/// - Windows: no-op (Rtl stacks; shrink unmaps instead).
+///
+/// Next write fault recommits/zeros pages as needed (FreeNode / new frames).
 pub fn stackRecycle(info: StackInfo) void {
     if (builtin.os.tag == .windows) return;
 
-    // Only recycle committed region (don't touch guard page or uncommitted regions)
     const committed_start = info.limit;
     const committed_size = info.base - info.limit;
     if (committed_size == 0) return;
 
     const addr: [*]align(page_size) u8 = @ptrFromInt(committed_start);
-
-    // MADV_FREE is available on Linux 4.5+, macOS, FreeBSD, NetBSD
-    // It allows lazy reclamation - physical pages are freed when system needs memory
-    posix.madvise(addr[0..committed_size], posix.MADV.FREE) catch {};
+    const advice: u32 = if (comptime builtin.os.tag.isDarwin())
+        posix.MADV.FREE_REUSABLE
+    else if (comptime @hasDecl(posix.MADV, "FREE"))
+        posix.MADV.FREE
+    else
+        posix.MADV.DONTNEED;
+    posix.madvise(addr[0..committed_size], advice) catch {};
 }
 
 pub const StackExtendMode = enum {

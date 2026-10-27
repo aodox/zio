@@ -135,6 +135,23 @@ pub const StackPool = struct {
         };
     }
 
+    /// Snapshot for product metrics (RSS / 6400-hold observability).
+    pub const Stats = struct {
+        in_use: usize,
+        retain_target: usize,
+        epoch_peak: usize,
+    };
+
+    pub fn stats(self: *StackPool) Stats {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return .{
+            .in_use = self.in_use,
+            .retain_target = self.retain_target,
+            .epoch_peak = self.epoch_peak,
+        };
+    }
+
     pub fn deinit(self: *StackPool) void {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -221,11 +238,14 @@ pub const StackPool = struct {
         self.epoch_peak = @max(self.epoch_peak, self.in_use);
     }
 
-    /// Releases a stack back to the pool. Never makes a syscall: slab slots
-    /// are pushed onto their slab's free list and individually mapped stacks
-    /// onto the pool's list. Returning memory to the OS happens only in the
-    /// periodic shrink pass.
+    /// Releases a stack back to the pool. Soft-frees dirtied committed pages
+    /// (`stackRecycle`) so freelist capacity does not pin peak RSS; VA stays
+    /// reserved until the periodic shrink pass unmaps idle slabs/stacks.
     pub fn release(self: *StackPool, stack_info: StackInfo) void {
+        // Soft-free before writing FreeNode so REALITY-sized dirty pages drop
+        // from the working set; the FreeNode store faults one page back.
+        stack.stackRecycle(stack_info);
+
         // The FreeNode is stored at the base of the stack (aligned backward)
         const node_addr = std.mem.alignBackward(usize, stack_info.base - @sizeOf(FreeNode), @alignOf(FreeNode));
 
@@ -307,12 +327,16 @@ pub const StackPool = struct {
             }
             self.last_shrink = now;
 
-            // Decay curve: ratchet up to this epoch's peak immediately, halve
-            // per interval on the way down, never below the prewarm floor. A
-            // burst's capacity drains with a half-life of one interval
-            // instead of vanishing the moment one quiet epoch passes.
+            // Decay curve: ratchet up to this epoch's peak immediately; on the
+            // way down halve normally, or quarter when live demand is <<
+            // retained freelist (post-burst / 6400-hold drain) so VA slabs
+            // munmap faster. Never below the prewarm floor.
+            const decayed = if (self.in_use * 4 < self.retain_target)
+                self.retain_target / 4
+            else
+                self.retain_target / 2;
             self.retain_target = @max(
-                @max(self.epoch_peak, self.retain_target / 2),
+                @max(self.epoch_peak, decayed),
                 self.config.prewarm,
             );
             self.epoch_peak = self.in_use;
