@@ -908,21 +908,58 @@ fn blockInPlaceImpl(func: anytype, args: std.meta.ArgsTuple(@TypeOf(func)), rese
     // completion callback, nothing touches this stack frame after we might
     // return, so there is no use-after-free window.
     //
-    // workFn always runs (token-bearing work is never dropped from the queue),
-    // so ctx.result is always valid. A canceled syscall makes `func` return
-    // error.Canceled, which surfaces here as that result; waitForIo re-arms the
-    // task's pending cancellation before returning.
+    // Cancel contract (same idea as libhv `hdns` detach / run-to-completion):
     //
-    // waitForIo only fails with error.Canceled, and only when the *completion*
-    // carries a Canceled result — which happens on the drop path, where workFn
-    // never runs and ctx.result would be undefined. Token-bearing work is never
-    // dropped (it always completes via setResult, cancellation delivered in-band
-    // through func's return), so this is unreachable. Assert it: were it ever to
-    // fire we would be returning uninitialized ctx.result, which we would much
-    // rather crash on.
-    waitForIo(&work.c) catch unreachable;
+    // 1. **Once submitted** (token-bearing): `waitForIo`'s cancel path already
+    //    `loopCancel`s then waits **uncancelably** until the worker finishes.
+    //    Token work is not dropped from the queue; CPU jobs on Windows cannot
+    //    be SIGURG-interrupted (`syscall_cancel.enabled == false`). So an
+    //    in-flight cancel returns success here with a defined `ctx.result`, and
+    //    re-arms task cancel for the next cancel point — never `unreachable`.
+    //
+    // 2. **Before submit**: `waitForIo` does `task.checkCancel()` before
+    //    `loopAdd`. If the fiber is already canceled (product `AutoCancel` /
+    //    REALITY TCPTimeout), it returns `error.Canceled` and **workFn never
+    //    runs** — `ctx.result` is undefined. The old `catch unreachable` was
+    //    therefore false (observed: Windows 6400-hold process panic). Surface
+    //    cancel without inventing a typed result (void / `error.Canceled`).
+    //
+    //    `checkCancel` consumes one `pending_errors`. When we map that to a
+    //    void return (or otherwise continue the fiber), re-arm with `recancel`
+    //    — same as waitForIo's "IO completed despite cancel" path — so the
+    //    next cancel point still observes Canceled.
+    //
+    // Evidence for (2): `waitForIo` (`try task.checkCancel()`); product panic
+    // stack through `blockInPlaceReserved` ← `cpu_heavy`.
+    waitForIo(&work.c) catch {
+        if (getWaitableTaskOrNull()) |task| task.recancel();
+        return blockInPlaceNotStarted(Result);
+    };
 
     return ctx.result;
+}
+
+/// Fiber was canceled before pool submit — `workFn` did not run.
+/// libhv analogue: cancel before the op is armed → no callback / no result.
+fn blockInPlaceNotStarted(comptime Result: type) Result {
+    switch (@typeInfo(Result)) {
+        .void => return,
+        .error_union => |eu| {
+            if (comptime errorSetHasCanceled(eu.error_set)) return error.Canceled;
+            @panic("blockInPlace: canceled before submit (error set lacks Canceled)");
+        },
+        else => @panic("blockInPlace: canceled before submit (non-void result)"),
+    }
+}
+
+fn errorSetHasCanceled(comptime ErrorSet: type) bool {
+    const info = @typeInfo(ErrorSet);
+    if (info != .error_set) return false;
+    const list = info.error_set orelse return true; // anyerror
+    inline for (list) |e| {
+        if (comptime std.mem.eql(u8, e.name, "Canceled")) return true;
+    }
+    return false;
 }
 
 const meta = @import("meta.zig");
@@ -1028,4 +1065,80 @@ test "blockInPlace: cancellation interrupts a blocking syscall on the worker" {
 
     // The worker catches the cancellation and returns normally, so join succeeds.
     try handle.join();
+}
+
+test "blockInPlace: already-canceled fiber does not panic and does not run work" {
+    // libhv: cancel before the op is armed → no callback / no side effect.
+    // Old zio: waitForIo checkCancel → catch unreachable → process panic.
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Probe = struct {
+        fn work(ran: *std.atomic.Value(bool)) void {
+            ran.store(true, .release);
+        }
+
+        fn body(
+            ran: *std.atomic.Value(bool),
+            returned: *std.atomic.Value(bool),
+            still_canceled: *std.atomic.Value(bool),
+        ) void {
+            const task = getCurrentTaskOrNull() orelse return;
+            task.cancel();
+            // Must not panic. workFn must not run (never submitted).
+            blockInPlaceReserved(work, .{ran});
+            // recancel must keep cancel armed for the next cancel point.
+            still_canceled.store(task.checkCancel() == error.Canceled, .release);
+            returned.store(true, .release);
+        }
+    };
+
+    var ran = std.atomic.Value(bool).init(false);
+    var returned = std.atomic.Value(bool).init(false);
+    var still_canceled = std.atomic.Value(bool).init(false);
+    var handle = try rt.spawn(Probe.body, .{ &ran, &returned, &still_canceled });
+    handle.join();
+
+    try std.testing.expect(returned.load(.acquire));
+    try std.testing.expect(!ran.load(.acquire));
+    try std.testing.expect(still_canceled.load(.acquire));
+}
+
+test "blockInPlaceReserved: cancel while CPU-bound still runs to completion" {
+    // libhv detach: in-flight work finishes; cancel only drops interest.
+    // waitForIo already drains uncancelably after loopCancel for token work;
+    // this pins that CPU-only jobs (no syscall) complete on every OS,
+    // including Windows where SIGURG cancel is disabled.
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Probe = struct {
+        fn cpu(started: *std.atomic.Value(bool), finished: *std.atomic.Value(bool)) void {
+            started.store(true, .release);
+            // Busy work long enough for the outer cancel to land mid-job.
+            var i: u64 = 0;
+            while (i < 30_000_000) : (i += 1) {
+                std.mem.doNotOptimizeAway(i);
+            }
+            finished.store(true, .release);
+        }
+
+        fn body(started: *std.atomic.Value(bool), finished: *std.atomic.Value(bool)) void {
+            blockInPlaceReserved(cpu, .{ started, finished });
+        }
+    };
+
+    var started = std.atomic.Value(bool).init(false);
+    var finished = std.atomic.Value(bool).init(false);
+    var handle = try rt.spawn(Probe.body, .{ &started, &finished });
+
+    while (!started.load(.acquire)) try rt.sleep(.fromMicroseconds(100));
+    handle.cancel();
+    handle.join();
+
+    try std.testing.expect(finished.load(.acquire));
 }
